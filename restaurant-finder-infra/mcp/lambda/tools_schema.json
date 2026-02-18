@@ -1,0 +1,39 @@
+[
+  {
+    "name": "search_restaurants",
+    "description": "Search for restaurants by location, cuisine, price range, and dietary needs. Returns structured results with ratings, addresses, and contact details.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Free-form search query for restaurants (e.g., \"best pizza near Times Square\", \"romantic dinner spot\")"
+        },
+        "cuisine": {
+          "type": "string",
+          "description": "Type of cuisine (e.g., \"Italian\", \"Japanese\", \"Mexican\", \"Indian\", \"Thai\")"
+        },
+        "location": {
+          "type": "string",
+          "description": "City or area to search (e.g., \"New York\", \"San Francisco\", \"Chicago\")"
+        },
+        "price_range": {
+          "type": "string",
+          "description": "Price level. Valid values: \"$\" (budget), \"$$\" (moderate), \"$$$\" (upscale), \"$$$$\" (fine dining). Default: \"$$\""
+        },
+        "dietary_restrictions": {
+          "type": "array",
+          "description": "Dietary requirements (e.g., [\"Vegetarian\", \"Gluten-Free\"])",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Maximum number of results to return (1-10, default: 5)"
+        }
+      },
+      "required": []
+    }
+  }
+]

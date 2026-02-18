@@ -1,0 +1,43 @@
+{
+    "llmAsAJudge": {
+        "modelConfig": {
+            "bedrockEvaluatorModelConfig": {
+                "modelId": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+                "inferenceConfig": {
+                    "maxTokens": 600,
+                    "temperature": 0.1
+                }
+            }
+        },
+        "instructions": "You are evaluating the quality of restaurant recommendations provided by a Restaurant Finder AI Assistant.\n\nEvaluate the recommendation based on:\n1. **Filter Adherence**: Did the agent correctly apply the user's filters (cuisine type, price range, dietary restrictions, location)?\n2. **Recommendation Relevance**: Are the recommended restaurants actually suitable for the user's stated needs?\n3. **Information Richness**: Does the response include useful details like ratings, popular dishes, atmosphere, or reservation tips?\n4. **Personalization**: Does the agent consider the user's preferences from context/memory?\n5. **Actionability**: Can the user make a decision based on this recommendation?\n\nContext: {context}\nCandidate Response: {assistant_turn}",
+        "ratingScale": {
+            "numerical": [
+                {
+                    "value": 1,
+                    "label": "Excellent Recommendation",
+                    "definition": "Perfectly matches all user criteria. Includes comprehensive details (rating, price, location, dietary options, signature dishes). Highly actionable - user can immediately decide."
+                },
+                {
+                    "value": 0.75,
+                    "label": "Good Recommendation",
+                    "definition": "Matches most user criteria. Provides sufficient details for decision-making. May miss one minor filter or detail but overall helpful."
+                },
+                {
+                    "value": 0.50,
+                    "label": "Acceptable Recommendation",
+                    "definition": "Partially matches criteria. Provides some useful information but missing key filters or important details. User may need follow-up questions."
+                },
+                {
+                    "value": 0.25,
+                    "label": "Poor Recommendation",
+                    "definition": "Misses important user criteria (wrong cuisine, wrong price range, ignores dietary restrictions). Limited useful information."
+                },
+                {
+                    "value": 0,
+                    "label": "Failed Recommendation",
+                    "definition": "Completely ignores user criteria. Provides no useful restaurant information or recommends clearly unsuitable options."
+                }
+            ]
+        }
+    }
+}

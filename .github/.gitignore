@@ -1,0 +1,7 @@
+# ====================
+# GitHub folder .gitignore
+# ====================
+
+# Keep workflows, but ignore any local test files
+*.local
+*.test

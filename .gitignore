@@ -1,0 +1,101 @@
+# ====================
+# Root-level .gitignore
+# ====================
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+restaurant-finder-api/.env
+restaurant-finder-ui/.env
+
+# Credentials / Secrets
+*.pem
+*.key
+credentials.json
+secrets.json
+*-credentials.json
+service-account*.json
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage / Test artifacts
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Node.js
+node_modules/
+.npm
+.yarn/
+
+# TypeScript compiled output (source is .ts files)
+restaurant-finder-infra/bin/**/*.js
+restaurant-finder-infra/bin/**/*.d.ts
+restaurant-finder-infra/lib/**/*.js
+restaurant-finder-infra/lib/**/*.d.ts
+
+# CDK
+cdk.out/
+cdk.context.json
+
+# Chainlit
+chainlit.db
+
+# Evaluation results (generated output)
+evaluation_results/
+
+# UV lock file is committed, but ignore local caches
+.uv/
+.bedrock_agentcore.yaml
+
+.claude/

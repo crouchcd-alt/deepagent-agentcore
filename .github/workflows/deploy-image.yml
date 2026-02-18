@@ -1,0 +1,109 @@
+name: Deploy Application Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "restaurant-finder-api/**"
+      - ".github/workflows/deploy-image.yml"
+  workflow_dispatch:
+    inputs:
+      skip_runtime_update:
+        description: "Push image only, skip runtime update"
+        required: false
+        default: "false"
+        type: boolean
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPO_NAME: restaurantfinder-agent
+  STACK_NAME: restaurantFinder-AgentCoreStack
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: restaurant-finder-api
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve runtime config
+        if: inputs.skip_runtime_update != true
+        id: runtime
+        run: |
+          RUNTIME_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='RuntimeId'].OutputValue" \
+            --output text)
+
+          CONFIG=$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$RUNTIME_ID")
+          echo "id=${RUNTIME_ID}" >> $GITHUB_OUTPUT
+          echo "role_arn=$(echo $CONFIG | jq -r '.roleArn')" >> $GITHUB_OUTPUT
+          echo "network_mode=$(echo $CONFIG | jq -r '.networkConfiguration.networkMode')" >> $GITHUB_OUTPUT
+
+          # Preserve existing environment variables (update-agent-runtime replaces the full config)
+          ENV_VARS=$(echo "$CONFIG" | jq -c '.environmentVariables // {}')
+          echo "env_vars=${ENV_VARS}" >> $GITHUB_OUTPUT
+
+      - name: Update runtime
+        if: inputs.skip_runtime_update != true
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}"
+          aws bedrock-agentcore-control update-agent-runtime \
+            --agent-runtime-id "${{ steps.runtime.outputs.id }}" \
+            --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"${IMAGE}\"}}" \
+            --role-arn "${{ steps.runtime.outputs.role_arn }}" \
+            --network-configuration "{\"networkMode\":\"${{ steps.runtime.outputs.network_mode }}\"}" \
+            --environment-variables '${{ steps.runtime.outputs.env_vars }}'
+
+      - name: Wait for runtime
+        if: inputs.skip_runtime_update != true
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(aws bedrock-agentcore-control get-agent-runtime \
+              --agent-runtime-id "${{ steps.runtime.outputs.id }}" \
+              --query status --output text)
+            echo "[$i/30] status=$STATUS"
+            [ "$STATUS" = "READY" ] && exit 0
+            [ "$STATUS" = "UPDATE_FAILED" ] || [ "$STATUS" = "FAILED" ] && exit 1
+            sleep 10
+          done
+          echo "Timed out waiting for runtime" && exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "- image: \`${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- runtime: \`${{ steps.runtime.outputs.id }}\`" >> $GITHUB_STEP_SUMMARY

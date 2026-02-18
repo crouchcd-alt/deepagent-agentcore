@@ -1,0 +1,49 @@
+# ====================
+# Chainlit UI .gitignore
+# ====================
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables (NEVER commit)
+.env
+.env.local
+!.env.example
+
+# Chainlit
+.chainlit/
+.files/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Linting
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# Lock files (optional - uncomment if you want to ignore)
+# uv.lock

@@ -1,0 +1,43 @@
+{
+    "llmAsAJudge": {
+        "modelConfig": {
+            "bedrockEvaluatorModelConfig": {
+                "modelId": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+                "inferenceConfig": {
+                    "maxTokens": 500,
+                    "temperature": 0.1
+                }
+            }
+        },
+        "instructions": "You are evaluating the quality of a Restaurant Finder AI Assistant's response. The assistant helps users find restaurants based on cuisine preferences, dietary restrictions, location, and price range.\n\nEvaluate the response based on these criteria:\n1. **Relevance**: Does the response directly address the user's restaurant query?\n2. **Accuracy**: Is the restaurant information factually correct and helpful?\n3. **Completeness**: Does it include key details (cuisine, location, price, dietary options)?\n4. **Scope Adherence**: The agent should ONLY answer questions about restaurants, food recommendations, and dining. Penalize responses that answer off-topic questions.\n\n**IMPORTANT**: A response quality can only be high if the agent remains within its scope of restaurant/dining recommendations. Penalize agents that answer questions outside this scope (e.g., general knowledge, coding, unrelated topics) with a Very Poor classification.\n\nContext: {context}\nCandidate Response: {assistant_turn}",
+        "ratingScale": {
+            "numerical": [
+                {
+                    "value": 1,
+                    "label": "Excellent",
+                    "definition": "Response perfectly addresses the restaurant query with accurate, complete information including cuisine, location, price range, and relevant dietary options. Stays completely within scope."
+                },
+                {
+                    "value": 0.75,
+                    "label": "Good",
+                    "definition": "Response is helpful and mostly complete. Addresses the restaurant query accurately but may lack some minor details. Stays within scope."
+                },
+                {
+                    "value": 0.50,
+                    "label": "Acceptable",
+                    "definition": "Response is partially helpful but missing key restaurant details or could be more specific. Stays within scope but needs improvement."
+                },
+                {
+                    "value": 0.25,
+                    "label": "Poor",
+                    "definition": "Response is mostly unhelpful, contains errors about restaurants, or provides vague/incomplete information. May be borderline off-topic."
+                },
+                {
+                    "value": 0,
+                    "label": "Very Poor",
+                    "definition": "Response is completely off-topic, answers non-restaurant questions, or fails to address the user's dining needs. Agent went outside its scope."
+                }
+            ]
+        }
+    }
+}

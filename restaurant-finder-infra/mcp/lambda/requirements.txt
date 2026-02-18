@@ -1,0 +1,3 @@
+# Lambda requirements
+# Note: boto3 is pre-installed in AWS Lambda Python runtime, no need to add it here
+# Add any additional dependencies below if needed
