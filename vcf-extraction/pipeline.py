@@ -27,14 +27,13 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-# Ensure the directory that contains schema.py is importable before the
-# module-level import below runs.
+# Ensure the directory that contains schema.py / interceptor.py is importable
+# before the module-level imports below run.
 sys.path.insert(0, str(Path(__file__).parent))
 
 from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
@@ -43,6 +42,7 @@ from langchain_agentcore_codeinterpreter import AgentCoreSandbox
 from langfuse import Langfuse
 from pydantic import ValidationError
 
+from interceptor import AgentInterceptor
 from schema import VariantExtractionResult
 
 # ---------------------------------------------------------------------------
@@ -254,19 +254,15 @@ def _stop_sandbox(interpreter: CodeInterpreter, parent: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_agentcore_tool(interpreter: CodeInterpreter, trace: Any):  # noqa: ANN201
+def _make_agentcore_tool(interpreter: CodeInterpreter):  # noqa: ANN201
     """
-    Return a plain Python callable that the DeepAgent can invoke as a tool,
-    plus a one-element list used as a mutable reference to the active agent
-    step span so that each code execution is nested under its parent step.
+    Return a plain Python callable that the DeepAgent can invoke as a tool.
 
-    The callable accepts a ``code`` keyword argument and returns the sandbox
-    stdout as a string.  Every invocation is recorded as a Langfuse *tool*
-    span with the submitted code, stdout, and wall-clock timing.
+    The callable accepts a ``code`` argument and returns the sandbox stdout as
+    a string.  Langfuse tracing for each invocation is handled by
+    :class:`AgentInterceptor` via its ``on_tool_start`` / ``on_tool_end``
+    callbacks — no manual span management is needed here.
     """
-    # Mutable slot updated by _run_agent_with_limits before/after each step
-    # so that execute_code spans are nested under the correct step span.
-    _step_span: list[Any] = [None]
 
     def execute_code(code: str) -> str:
         """
@@ -278,33 +274,9 @@ def _make_agentcore_tool(interpreter: CodeInterpreter, trace: Any):  # noqa: ANN
         Returns:
             The standard output produced by the code execution.
         """
-        parent = _step_span[0] if _step_span[0] is not None else trace
-        t0 = time.monotonic()
-        span = parent.start_observation(
-            name="agentcore.execute_code",
-            as_type="tool",
-            input={"code": code, "code_length": len(code)},
-            metadata={"session_id": interpreter.session_id},
-        )
-        try:
-            stdout = _run_python(interpreter, code)
-            span.update(
-                output={"stdout": stdout, "output_length": len(stdout)},
-                metadata={
-                    "session_id": interpreter.session_id,
-                    "elapsed_seconds": round(time.monotonic() - t0, 3),
-                    "code_length": len(code),
-                    "output_length": len(stdout),
-                },
-            )
-            return stdout
-        except Exception as exc:
-            span.update(level="ERROR", status_message=str(exc))
-            raise
-        finally:
-            span.end()
+        return _run_python(interpreter, code)
 
-    return execute_code, _step_span
+    return execute_code
 
 
 # ---------------------------------------------------------------------------
@@ -356,186 +328,40 @@ _EXTRACTION_PROMPT = (
 )
 
 
-def _extract_tool_calls(result: Any) -> list[dict[str, Any]]:
-    """Extract any LLM tool-call records from a deepagents / LangGraph result."""
-    calls: list[dict[str, Any]] = []
-    if not isinstance(result, dict):
-        return calls
-    for msg in result.get("messages", []):
-        raw_calls = getattr(msg, "tool_calls", None)
-        if not raw_calls:
-            continue
-        for tc in raw_calls:
-            if isinstance(tc, dict):
-                calls.append({"name": tc.get("name"), "args": tc.get("args")})
-            else:
-                calls.append({"name": getattr(tc, "name", str(tc))})
-    return calls
-
-
-def _extract_usage(result: Any) -> dict[str, int]:
-    """
-    Sum token counts across all AI messages in a deepagents / LangGraph result.
-
-    Tries the LangChain-standard ``usage_metadata`` field first
-    (``input_tokens`` / ``output_tokens``), then falls back to the
-    Bedrock-specific ``response_metadata['usage']`` (``inputTokens`` /
-    ``outputTokens``) for older langchain-aws versions.
-
-    Returns a dict with ``"input"``, ``"output"``, and ``"total"`` keys
-    suitable for passing directly to a Langfuse ``usage_details`` parameter,
-    or an empty dict if no usage data was found.
-    """
-    input_tokens = output_tokens = 0
-    if not isinstance(result, dict):
-        return {}
-    for msg in result.get("messages", []):
-        # LangChain standard (langchain_core >= 0.2, langchain-aws >= 0.2)
-        usage = getattr(msg, "usage_metadata", None)
-        if isinstance(usage, dict):
-            input_tokens += usage.get("input_tokens", 0)
-            output_tokens += usage.get("output_tokens", 0)
-            continue
-        # Bedrock-specific fallback via response_metadata
-        resp_meta = getattr(msg, "response_metadata", {})
-        bedrock = resp_meta.get("usage", {}) if isinstance(resp_meta, dict) else {}
-        input_tokens += bedrock.get("inputTokens", 0)
-        output_tokens += bedrock.get("outputTokens", 0)
-    if input_tokens == 0 and output_tokens == 0:
-        return {}
-    return {"input": input_tokens, "output": output_tokens, "total": input_tokens + output_tokens}
-
-
-def _run_agent_with_limits(
+def _run_agent_with_interceptor(
     agent,  # noqa: ANN001
-    langfuse_trace,  # noqa: ANN001
-    step_span_holder: list[Any],
+    interceptor: AgentInterceptor,
 ) -> str:
     """
-    Run *agent* with wall-clock timeout and step-count limits.
+    Run the deepagent once with the interceptor wired in as a LangChain callback.
 
-    Each agent step is recorded in Langfuse as a child span of
-    *langfuse_trace*, capturing the full conversation input, any tool calls
-    the LLM emitted, and the assistant reply.  The *step_span_holder* slot is
-    set to the active step span before the agent is invoked so that every
-    ``execute_code`` tool call is nested under the correct step.
+    Passing the interceptor via ``config["callbacks"]`` means LangChain
+    propagates it automatically to every sub-chain, LLM call, and tool
+    invocation inside the LangGraph state machine.  The interceptor fires
+    *synchronously* on each event, so:
+
+    * Langfuse spans are opened and closed in real time as the agent reasons.
+    * Timeout and iteration-count limits are enforced at the start of every
+      LLM call, interrupting the agent immediately when a limit is breached.
 
     Args:
-        agent:            The DeepAgent instance.
-        langfuse_trace:   An active Langfuse trace / span object.
-        step_span_holder: Single-element list shared with the
-            ``execute_code`` tool closure; updated to the current step span
-            before each agent invocation so tool spans are correctly nested.
+        agent:       The DeepAgent instance (must implement ``.invoke()``).
+        interceptor: A configured :class:`AgentInterceptor`.
 
     Returns:
         The agent's final text output.
 
     Raises:
-        TimeoutError: If the wall-clock limit is exceeded.
-        RuntimeError: If the agent exceeds the maximum iteration count.
+        TimeoutError: Propagated from the interceptor when the wall-clock
+            limit is exceeded.
+        RuntimeError: Propagated from the interceptor when the iteration
+            limit is exceeded.
     """
-    start_time = time.monotonic()
-    step_count = 0
-    last_output = ""
-
-    # ------------------------------------------------------------------
-    # Graceful SIGALRM-based timeout (Unix only).  On Windows the signal
-    # is silently skipped and only the monotonic-clock check applies.
-    # ------------------------------------------------------------------
-    _timeout_fired = False
-
-    def _alarm_handler(signum: int, frame: object) -> None:  # noqa: ARG001
-        nonlocal _timeout_fired
-        _timeout_fired = True
-
-    if hasattr(signal, "SIGALRM"):
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(AGENT_TIMEOUT_SECONDS)
-
-    try:
-        messages: list[dict[str, str]] = [
-            {"role": "user", "content": _EXTRACTION_PROMPT}
-        ]
-
-        while True:
-            # --- Check limits ---
-            elapsed = time.monotonic() - start_time
-            if _timeout_fired or elapsed > AGENT_TIMEOUT_SECONDS:
-                raise TimeoutError(
-                    f"Agent exceeded wall-clock limit of {AGENT_TIMEOUT_SECONDS}s "
-                    f"(elapsed: {elapsed:.1f}s)."
-                )
-            if step_count >= AGENT_MAX_ITERATIONS:
-                raise RuntimeError(
-                    f"Agent exceeded maximum iteration count of {AGENT_MAX_ITERATIONS}."
-                )
-
-            step_count += 1
-            step_span = langfuse_trace.start_observation(
-                name=f"agent_step_{step_count}",
-                as_type="generation",
-                model=_BEDROCK_MODEL_ID,
-                input={
-                    "messages": messages,
-                    "message_count": len(messages),
-                },
-                metadata={"step": step_count, "elapsed_seconds": round(elapsed, 3)},
-            )
-            # Share with execute_code so its spans nest under this step.
-            step_span_holder[0] = step_span
-
-            # --- Execute one step ---
-            # deepagents exposes .step() for single-turn execution;
-            # fall back to .invoke() for libraries that only expose invoke.
-            try:
-                if hasattr(agent, "step"):
-                    result = agent.step({"messages": messages})
-                else:
-                    result = agent.invoke({"messages": messages})
-            except Exception as exc:
-                step_span.update(level="ERROR", status_message=str(exc))
-                step_span.end()
-                step_span_holder[0] = None
-                raise
-
-            step_span_holder[0] = None
-
-            # Extract the assistant reply, tool calls, and token usage.
-            assistant_msg = _extract_assistant_message(result)
-            tool_calls = _extract_tool_calls(result)
-            usage = _extract_usage(result)
-            last_output = assistant_msg
-
-            step_span.update(
-                output={
-                    "assistant": assistant_msg,
-                    "tool_calls": tool_calls,
-                    "is_terminal": _is_done(result),
-                },
-                usage_details=usage or None,
-                metadata={
-                    "step": step_count,
-                    "elapsed_seconds": round(time.monotonic() - start_time, 3),
-                    "tool_call_count": len(tool_calls),
-                },
-            )
-            step_span.end()
-
-            # Append the assistant reply to the message history
-            messages.append({"role": "assistant", "content": assistant_msg})
-
-            # --- Termination check ---
-            # The agent signals it is done when no further tool calls are
-            # pending.  deepagents returns a graph state dict; if
-            # 'next' is empty the run is complete.
-            if _is_done(result):
-                break
-
-    finally:
-        if hasattr(signal, "SIGALRM"):
-            signal.alarm(0)  # Cancel any pending alarm
-
-    return last_output
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": _EXTRACTION_PROMPT}]},
+        config={"callbacks": [interceptor]},
+    )
+    return _extract_assistant_message(result)
 
 
 def _extract_assistant_message(result: Any) -> str:
@@ -561,19 +387,6 @@ def _extract_assistant_message(result: Any) -> str:
                 return "".join(parts)
             return str(content)
     return str(result)
-
-
-def _is_done(result: Any) -> bool:
-    """
-    Return True when the agent graph has reached a terminal state.
-
-    deepagents / LangGraph signals completion by returning a state dict
-    with an empty or absent 'next' key.
-    """
-    if isinstance(result, dict):
-        next_steps = result.get("next", [])
-        return not next_steps
-    return True  # For plain string returns, treat as terminal
 
 
 # ---------------------------------------------------------------------------
@@ -688,18 +501,38 @@ def main() -> None:
 
         # --- Step 5: Build agent ---
         print("Building DeepAgent with AgentCore code interpreter...")
-        execute_code_tool, step_span_holder = _make_agentcore_tool(interpreter, trace)
+        execute_code_tool = _make_agentcore_tool(interpreter)
         agent = _build_agent(execute_code_tool, sandbox)
         trace.create_event(name="agent_built", metadata={"model": _BEDROCK_MODEL_ID})
 
-        # --- Step 6: Run agent ---
+        # --- Step 6: Create interceptor and run agent ---
         print(
             f"Running agent (timeout={AGENT_TIMEOUT_SECONDS}s, "
             f"max_iterations={AGENT_MAX_ITERATIONS})..."
         )
-        raw_output = _run_agent_with_limits(agent, trace, step_span_holder)
+        interceptor = AgentInterceptor(
+            langfuse_parent=trace,
+            timeout_seconds=AGENT_TIMEOUT_SECONDS,
+            max_iterations=AGENT_MAX_ITERATIONS,
+            model_id=_BEDROCK_MODEL_ID,
+        )
+        trace.create_event(
+            name="interceptor_attached",
+            metadata={
+                "timeout_seconds": AGENT_TIMEOUT_SECONDS,
+                "max_iterations": AGENT_MAX_ITERATIONS,
+            },
+        )
+        raw_output = _run_agent_with_interceptor(agent, interceptor)
         print("Agent run complete.")
-        trace.create_event(name="agent_complete", metadata={"output_preview": raw_output[:500]})
+        trace.create_event(
+            name="agent_complete",
+            metadata={
+                "output_preview": raw_output[:500],
+                "llm_call_count": interceptor.llm_call_count,
+                "elapsed_seconds": round(interceptor.elapsed_seconds, 3),
+            },
+        )
 
         # --- Step 7: Parse and validate output ---
         print("Parsing and validating agent output...")
