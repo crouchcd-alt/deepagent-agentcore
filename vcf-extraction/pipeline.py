@@ -58,14 +58,13 @@ load_dotenv(dotenv_path=_ENV_FILE, override=True)
 
 LANGFUSE_PUBLIC_KEY: str = os.environ["LANGFUSE_PUBLIC_KEY"]
 LANGFUSE_SECRET_KEY: str = os.environ["LANGFUSE_SECRET_KEY"]
-# Accept either LANGFUSE_BASE_URL (preferred) or the legacy LANGFUSE_HOST name.
-LANGFUSE_HOST: str = (
-    os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+# Accept either LANGFUSE_BASE_URL (preferred) or the legacy LANGFUSE_BASE_URL name.
+LANGFUSE_BASE_URL: str = os.getenv("LANGFUSE_BASE_URL") or os.getenv(
+    "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
 )
 
 AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
 
-AGENT_TIMEOUT_SECONDS: int = int(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
 AGENT_MAX_ITERATIONS: int = int(os.getenv("AGENT_MAX_ITERATIONS", "10"))
 
 OUTPUT_JSON_PATH: Path = Path(os.getenv("OUTPUT_JSON_PATH", "vcf_extraction_results.json"))
@@ -88,10 +87,10 @@ def _init_langfuse() -> Langfuse:
     client = Langfuse(
         public_key=LANGFUSE_PUBLIC_KEY,
         secret_key=LANGFUSE_SECRET_KEY,
-        host=LANGFUSE_HOST,
+        host=LANGFUSE_BASE_URL,
     )
     if not client.auth_check():
-        raise RuntimeError(f"Langfuse auth failed – check keys and host ({LANGFUSE_HOST})")
+        raise RuntimeError(f"Langfuse auth failed – check keys and host ({LANGFUSE_BASE_URL})")
     return client
 
 
@@ -137,9 +136,7 @@ def _run_python(interpreter: CodeInterpreter, code: str) -> str:
     Returns:
         Combined stdout / result text from the sandbox.
     """
-    response = interpreter.invoke(
-        method="executeCode", params={"language": "python", "code": code}
-    )
+    response = interpreter.invoke(method="executeCode", params={"language": "python", "code": code})
     output_parts: list[str] = []
     for event in response.get("stream", []):
         if "result" not in event:
@@ -168,10 +165,7 @@ def _upload_files(
     Creates a single Langfuse span recording all file names, sizes, and
     upload timing.
     """
-    file_infos = [
-        {"local": p.name, "remote": r, "size_bytes": p.stat().st_size}
-        for p, r in files
-    ]
+    file_infos = [{"local": p.name, "remote": r, "size_bytes": p.stat().st_size} for p, r in files]
     t0 = time.monotonic()
     span = parent.start_observation(
         name="agentcore.upload_files",
@@ -284,7 +278,7 @@ def _make_agentcore_tool(interpreter: CodeInterpreter):  # noqa: ANN201
 # ---------------------------------------------------------------------------
 
 
-_BEDROCK_MODEL_ID = "amazon.nova-lite-v1:0"
+_BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
 
 
 def _build_agent(agentcore_tool, sandbox: AgentCoreSandbox):  # noqa: ANN001, ANN201
@@ -315,17 +309,22 @@ def _build_agent(agentcore_tool, sandbox: AgentCoreSandbox):  # noqa: ANN001, AN
     return agent
 
 
-_EXTRACTION_PROMPT = (
-    "Extract variant data using the `execute_code` tool. "
-    "The files you need to process are located in the remote sandbox: /opt/amazon/genesis1p-tools/pme/variants.vcf "
-    "with the target Pydantic schema located in /opt/amazon/genesis1p-tools/pme/schema.py. "
-    "If you have trouble locating the file directly, use execute_code to list the directory contents and find the correct path. "
-    "Try at least three different ways to locate the files if you do not find them on the first attempt. "
-    "Validate all fields, correct formatting errors where possible (for example, "
-    "coerce strings to floats for allele frequency), and return a JSON array of "
-    "validated records under the key 'records', plus a 'total' count and a "
-    "'validation_errors' list."
-)
+_EXTRACTION_PROMPT = """
+Extract variant data using the `execute_code` tool.
+
+<file_processing>
+- /opt/amazon/genesis1p-tools/var/pme/variants.vcf: VCF file containing genetic variants to extract.
+- /opt/amazon/genesis1p-tools/var/pme/schema.py: Pydantic schema for validating extracted variants.
+
+If the VCF is too large (e.g., more than a few hundred rows), break the file into chunks and process them separately, merging them to produce the final output.
+</file_processing>
+
+<validation>
+Validate all fields, correct formatting errors where possible (for example, coerce strings to floats for allele frequency). Validate by loading the extracted variants using the methods provided by Pydantic exclusively (e.g., .model_dump()).
+</validation>
+
+YOUR LAST MESSAGE SHOULD BE A JSON OBJECT FROM THE PYDANTIC SCHEMA. NO PROSE OR PREAMBLE, JUST THE RAW JSON OBJECT.
+"""
 
 
 def _run_agent_with_interceptor(
@@ -462,7 +461,6 @@ def main() -> None:
         name="vcf-extraction-pipeline",
         as_type="span",
         metadata={
-            "timeout_seconds": AGENT_TIMEOUT_SECONDS,
             "max_iterations": AGENT_MAX_ITERATIONS,
             "vcf_path": str(_VCF_PATH),
         },
@@ -506,20 +504,15 @@ def main() -> None:
         trace.create_event(name="agent_built", metadata={"model": _BEDROCK_MODEL_ID})
 
         # --- Step 6: Create interceptor and run agent ---
-        print(
-            f"Running agent (timeout={AGENT_TIMEOUT_SECONDS}s, "
-            f"max_iterations={AGENT_MAX_ITERATIONS})..."
-        )
+        print(f"Running agent (max_iterations={AGENT_MAX_ITERATIONS})...")
         interceptor = AgentInterceptor(
             langfuse_parent=trace,
-            timeout_seconds=AGENT_TIMEOUT_SECONDS,
             max_iterations=AGENT_MAX_ITERATIONS,
             model_id=_BEDROCK_MODEL_ID,
         )
         trace.create_event(
             name="interceptor_attached",
             metadata={
-                "timeout_seconds": AGENT_TIMEOUT_SECONDS,
                 "max_iterations": AGENT_MAX_ITERATIONS,
             },
         )

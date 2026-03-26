@@ -23,6 +23,7 @@ class VariantRecord(BaseModel):
     chrom: str
     pos: int
     id: Optional[str] = None
+    id_type: Optional[str] = None  # e.g. 'COSMIC'
     ref: str
     alt: str
     qual: Optional[float] = None
@@ -92,13 +93,29 @@ class VariantRecord(BaseModel):
     @model_validator(mode="after")
     def validate_chrom_prefix(self) -> "VariantRecord":
         """
-        Normalise chromosome names.
+        Normalize chromosome names.
 
         Ensures the chromosome string starts with 'chr'. VCF files from
         different sources may omit the prefix (e.g. '1' vs 'chr1').
         """
         if self.chrom and not self.chrom.startswith("chr"):
             self.chrom = f"chr{self.chrom}"
+        return self
+
+    @model_validator(mode="after")
+    def validate_id_type(self) -> "VariantRecord":
+        """
+        Normalize ID types.
+
+        Ensures the ID type is derived from the ID field (e.g. 'COSMIC' if ID starts with 'COSM').
+        """
+        if not self.id:
+            self.id_type = None
+        else:
+            if self.id.startswith("COSM"):
+                self.id_type = "COSMIC"
+            else:
+                self.id_type = "unknown"
         return self
 
 

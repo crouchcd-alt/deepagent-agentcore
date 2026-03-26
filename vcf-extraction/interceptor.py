@@ -7,17 +7,15 @@ execution graph and provides two capabilities:
    This means Langfuse receives events as they occur, not batch-uploaded only
    after the whole agent run returns.
 
-2. **Inline limit enforcement** – checks AGENT_TIMEOUT_SECONDS and
-   AGENT_MAX_ITERATIONS at the very beginning of each LLM invocation
+2. **Inline limit enforcement** – checks AGENT_MAX_ITERATIONS at the very beginning of each LLM invocation
    (``on_llm_start`` / ``on_chat_model_start``).  When a limit is breached it
-   raises ``TimeoutError`` or ``RuntimeError`` directly inside the LangGraph
+   raises ``RuntimeError`` directly inside the LangGraph
    event loop, propagating back to the pipeline's ``main()`` caller.
 
 Usage
 -----
     interceptor = AgentInterceptor(
         langfuse_parent=trace,
-        timeout_seconds=AGENT_TIMEOUT_SECONDS,
         max_iterations=AGENT_MAX_ITERATIONS,
         model_id=_BEDROCK_MODEL_ID,
     )
@@ -33,6 +31,8 @@ nested tool invocation inside the LangGraph state machine.
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import time
 import uuid
 from typing import Any
@@ -40,6 +40,25 @@ from typing import Any
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
+
+# ---------------------------------------------------------------------------
+# Module logger with rotating file handler
+# ---------------------------------------------------------------------------
+
+_LOG_FILE = "agent_interceptor.log"
+_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per file
+_LOG_BACKUP_COUNT = 5  # keep up to 5 rotated files
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    _LOG_FILE,
+    maxBytes=_LOG_MAX_BYTES,
+    backupCount=_LOG_BACKUP_COUNT,
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s %(message)s"))
+logger.addHandler(_file_handler)
 
 
 class AgentInterceptor(BaseCallbackHandler):
@@ -51,8 +70,6 @@ class AgentInterceptor(BaseCallbackHandler):
     langfuse_parent:
         A Langfuse trace or span object.  All child observations created by
         this interceptor are attached to this parent.
-    timeout_seconds:
-        Maximum wall-clock seconds the agent is allowed to run.
     max_iterations:
         Maximum number of LLM invocations (a reliable proxy for agent
         "reasoning steps") before the run is interrupted.
@@ -68,13 +85,11 @@ class AgentInterceptor(BaseCallbackHandler):
     def __init__(
         self,
         langfuse_parent: Any,
-        timeout_seconds: int,
         max_iterations: int,
         model_id: str,
     ) -> None:
         super().__init__()
         self._parent = langfuse_parent
-        self._timeout_seconds = timeout_seconds
         self._max_iterations = max_iterations
         self._model_id = model_id
 
@@ -98,21 +113,16 @@ class AgentInterceptor(BaseCallbackHandler):
         are enforced as soon as the agent attempts a new reasoning step.
 
         Raises:
-            TimeoutError: When the wall-clock elapsed time exceeds
-                ``timeout_seconds``.
             RuntimeError: When the number of LLM calls reaches
                 ``max_iterations``.
         """
-        elapsed = time.monotonic() - self._start_time
-        if elapsed > self._timeout_seconds:
-            raise TimeoutError(
-                f"Agent exceeded wall-clock limit of {self._timeout_seconds}s "
-                f"(elapsed: {elapsed:.1f}s)."
-            )
         if self._llm_call_count >= self._max_iterations:
-            raise RuntimeError(
-                f"Agent exceeded maximum iteration count of {self._max_iterations}."
+            logger.warning(
+                "Max iterations reached: count=%d limit=%d",
+                self._llm_call_count,
+                self._max_iterations,
             )
+            raise RuntimeError(f"Agent exceeded maximum iteration count of {self._max_iterations}.")
 
     def _elapsed(self) -> float:
         """Seconds elapsed since this interceptor was constructed."""
@@ -141,11 +151,14 @@ class AgentInterceptor(BaseCallbackHandler):
         self._llm_call_count += 1
         run_key = str(run_id)
         self._run_start[run_key] = time.monotonic()
+        logger.info(
+            "LLM call #%d starting (model=%s, run_id=%s, elapsed=%.3fs)",
+            self._llm_call_count,
+            self._model_id,
+            run_key,
+            self._elapsed(),
+        )
         span = self._parent.start_observation(
-            name=f"llm_call_{self._llm_call_count}",
-            as_type="generation",
-            model=self._model_id,
-            input={"prompts": prompts},
             metadata={
                 "llm_call": self._llm_call_count,
                 "elapsed_seconds": round(self._elapsed(), 3),
@@ -173,6 +186,13 @@ class AgentInterceptor(BaseCallbackHandler):
         self._llm_call_count += 1
         run_key = str(run_id)
         self._run_start[run_key] = time.monotonic()
+        logger.info(
+            "Chat model call #%d starting (model=%s, run_id=%s, elapsed=%.3fs)",
+            self._llm_call_count,
+            self._model_id,
+            run_key,
+            self._elapsed(),
+        )
         # Serialise the message list to a JSON-safe structure for Langfuse.
         serialised_msgs = [
             [{"role": getattr(m, "type", "unknown"), "content": _msg_content(m)} for m in turn]
@@ -205,6 +225,12 @@ class AgentInterceptor(BaseCallbackHandler):
             return
         call_elapsed = time.monotonic() - self._run_start.pop(run_key, time.monotonic())
         usage = _parse_usage(response)
+        logger.info(
+            "LLM call completed (run_id=%s, elapsed=%.3fs, usage=%s)",
+            run_key,
+            call_elapsed,
+            usage or "n/a",
+        )
         output_texts = [gen.text for gens in response.generations for gen in gens]
         span.update(
             output={"texts": output_texts},
@@ -227,6 +253,7 @@ class AgentInterceptor(BaseCallbackHandler):
         run_key = str(run_id)
         span = self._spans.pop(run_key, None)
         if span:
+            logger.error("LLM call failed (run_id=%s): %s", run_key, error)
             span.update(level="ERROR", status_message=str(error))
             span.end()
         self._run_start.pop(run_key, None)
@@ -248,6 +275,12 @@ class AgentInterceptor(BaseCallbackHandler):
         run_key = str(run_id)
         self._run_start[run_key] = time.monotonic()
         tool_name = serialized.get("name", "unknown_tool")
+        logger.info(
+            "Tool '%s' starting (run_id=%s, elapsed=%.3fs)",
+            tool_name,
+            run_key,
+            self._elapsed(),
+        )
         span = self._parent.start_observation(
             name=f"tool.{tool_name}",
             as_type="tool",
@@ -272,6 +305,11 @@ class AgentInterceptor(BaseCallbackHandler):
         if span is None:
             return
         call_elapsed = time.monotonic() - self._run_start.pop(run_key, time.monotonic())
+        logger.info(
+            "Tool completed (run_id=%s, elapsed=%.3fs)",
+            run_key,
+            call_elapsed,
+        )
         span.update(
             output={"output": str(output)},
             metadata={
@@ -292,6 +330,7 @@ class AgentInterceptor(BaseCallbackHandler):
         run_key = str(run_id)
         span = self._spans.pop(run_key, None)
         if span:
+            logger.error("Tool failed (run_id=%s): %s", run_key, error)
             span.update(level="ERROR", status_message=str(error))
             span.end()
         self._run_start.pop(run_key, None)
