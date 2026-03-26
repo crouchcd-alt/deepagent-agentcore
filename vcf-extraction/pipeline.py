@@ -8,8 +8,8 @@ Workflow
 3. Provision an AWS AgentCore code-interpreter sandbox session.
 4. Seed the sandbox with schema.py and variants.vcf.
 5. Verify that pydantic is importable inside the remote runtime.
-6. Construct a DeepAgent (Claude 3.5 Sonnet) bound to the AgentCore
-   code interpreter as its primary tool.
+6. Construct a DeepAgent (Amazon Nova Lite via AWS Bedrock) bound to the
+   AgentCore code interpreter as its primary tool.
 7. Run the agent with interrupt logic (wall-clock timeout + step cap).
 8. Stream every reasoning step and tool-call to Langfuse in real-time.
 9. Capture the final JSON output, validate it locally, and persist it.
@@ -25,7 +25,6 @@ See .env.example for the full list of required variables.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import signal
@@ -38,8 +37,9 @@ from typing import Any
 # module-level import below runs.
 sys.path.insert(0, str(Path(__file__).parent))
 
-import boto3
+from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
 from dotenv import load_dotenv
+from langchain_agentcore_codeinterpreter import AgentCoreSandbox
 from langfuse import Langfuse
 from pydantic import ValidationError
 
@@ -58,7 +58,10 @@ load_dotenv(dotenv_path=_ENV_FILE, override=True)
 
 LANGFUSE_PUBLIC_KEY: str = os.environ["LANGFUSE_PUBLIC_KEY"]
 LANGFUSE_SECRET_KEY: str = os.environ["LANGFUSE_SECRET_KEY"]
-LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+# Accept either LANGFUSE_BASE_URL (preferred) or the legacy LANGFUSE_HOST name.
+LANGFUSE_HOST: str = (
+    os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+)
 
 AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
 
@@ -72,11 +75,8 @@ _SCRIPT_DIR = Path(__file__).parent
 _SCHEMA_PATH = _SCRIPT_DIR / "schema.py"
 _VCF_PATH = _SCRIPT_DIR / "variants.vcf"
 
-# The code-interpreter identifier used by all AWS AgentCore regions
-_CODE_INTERPRETER_ID = "aws.codeinterpreter.v1"
-
 # Sandbox destination directory
-_SANDBOX_DATA_DIR = "/mnt/data"
+_SANDBOX_DATA_DIR = "/pme"
 
 # ---------------------------------------------------------------------------
 # Langfuse initialisation
@@ -84,12 +84,14 @@ _SANDBOX_DATA_DIR = "/mnt/data"
 
 
 def _init_langfuse() -> Langfuse:
-    """Initialise and return a configured Langfuse client."""
+    """Initialise, auth-check, and return a configured Langfuse client."""
     client = Langfuse(
         public_key=LANGFUSE_PUBLIC_KEY,
         secret_key=LANGFUSE_SECRET_KEY,
         host=LANGFUSE_HOST,
     )
+    if not client.auth_check():
+        raise RuntimeError(f"Langfuse auth failed – check keys and host ({LANGFUSE_HOST})")
     return client
 
 
@@ -98,97 +100,153 @@ def _init_langfuse() -> Langfuse:
 # ---------------------------------------------------------------------------
 
 
-def _create_agentcore_client() -> Any:
-    """Return a boto3 bedrock-agentcore client."""
-    return boto3.client("bedrock-agentcore", region_name=AWS_REGION)
-
-
-def _start_sandbox(client: Any) -> str:
+def _start_sandbox(interpreter: CodeInterpreter, parent: Any) -> None:
     """
     Start a new AgentCore code-interpreter session.
 
-    Returns:
-        The session ID string for subsequent API calls.
+    Creates a Langfuse span under *parent* capturing the region and the
+    returned session ID with wall-clock timing.
     """
-    response = client.start_code_interpreter_session(
-        codeInterpreterIdentifier=_CODE_INTERPRETER_ID
+    t0 = time.monotonic()
+    span = parent.start_observation(
+        name="agentcore.start_session",
+        as_type="span",
+        input={"region": AWS_REGION},
     )
-    session_id: str = response["sessionId"]
-    return session_id
+    try:
+        interpreter.start()
+        span.update(
+            output={"session_id": interpreter.session_id},
+            metadata={"elapsed_seconds": round(time.monotonic() - t0, 3)},
+        )
+    except Exception as exc:
+        span.update(level="ERROR", status_message=str(exc))
+        raise
+    finally:
+        span.end()
 
 
-def _run_code(client: Any, session_id: str, code: str) -> str:
+def _run_python(interpreter: CodeInterpreter, code: str) -> str:
     """
-    Execute *code* inside the sandbox and return stdout as a string.
+    Execute Python *code* inside the sandbox and return stdout as a string.
 
     Args:
-        client:     The bedrock-agentcore boto3 client.
-        session_id: The active sandbox session ID.
-        code:       Python source code to execute.
+        interpreter: An active :class:`CodeInterpreter` instance.
+        code:        Python source code to execute.
 
     Returns:
         Combined stdout / result text from the sandbox.
     """
-    response = client.invoke_code_interpreter(
-        codeInterpreterIdentifier=_CODE_INTERPRETER_ID,
-        sessionId=session_id,
-        name="executeCode",
-        arguments={"language": "python", "code": code},
+    response = interpreter.invoke(
+        method="executeCode", params={"language": "python", "code": code}
     )
-    # The response body is a streaming blob; read it fully.
     output_parts: list[str] = []
-    body = response.get("body") or response.get("output") or ""
-    if hasattr(body, "read"):
-        raw = body.read()
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        output_parts.append(raw)
-    elif isinstance(body, (list, tuple)):
-        for part in body:
-            if isinstance(part, dict):
-                output_parts.append(part.get("text", str(part)))
-            else:
-                output_parts.append(str(part))
-    elif isinstance(body, str):
-        output_parts.append(body)
+    for event in response.get("stream", []):
+        if "result" not in event:
+            continue
+        for item in event["result"].get("content", []):
+            if item.get("type") == "text":
+                output_parts.append(item.get("text", ""))
+            elif item.get("type") == "error":
+                output_parts.append(f"Error: {item.get('text', 'Unknown error')}")
     return "\n".join(output_parts)
 
 
-def _upload_file(client: Any, session_id: str, local_path: Path, remote_path: str) -> None:
+def _upload_files(
+    sandbox: AgentCoreSandbox,
+    files: list[tuple[Path, str]],
+    parent: Any,
+) -> None:
     """
-    Write *local_path* contents into the sandbox at *remote_path*.
+    Upload local files into the sandbox using :class:`AgentCoreSandbox`.
 
-    The file contents are base64-encoded before being embedded in the
-    generated code string so that no special-character escaping is needed
-    regardless of what the source file contains.
+    Args:
+        sandbox: An :class:`AgentCoreSandbox` wrapping the active session.
+        files:   List of ``(local_path, remote_path)`` pairs to upload.
+        parent:  Langfuse observation to attach the span to.
+
+    Creates a single Langfuse span recording all file names, sizes, and
+    upload timing.
     """
-    raw_bytes = local_path.read_bytes()
-    b64 = base64.b64encode(raw_bytes).decode("ascii")
-    upload_code = f"""\
-import base64, pathlib
-_dest = pathlib.Path("{remote_path}")
-_dest.parent.mkdir(parents=True, exist_ok=True)
-_dest.write_bytes(base64.b64decode("{b64}"))
-print(f"Uploaded {remote_path} ({{_dest.stat().st_size}} bytes)")
-"""
-    _run_code(client, session_id, upload_code)
-
-
-def _verify_pydantic(client: Any, session_id: str) -> str:
-    """Return the pydantic version string available in the sandbox."""
-    return _run_code(
-        client,
-        session_id,
-        "import pydantic; print(f'pydantic {pydantic.__version__} OK')",
+    file_infos = [
+        {"local": p.name, "remote": r, "size_bytes": p.stat().st_size}
+        for p, r in files
+    ]
+    t0 = time.monotonic()
+    span = parent.start_observation(
+        name="agentcore.upload_files",
+        as_type="span",
+        input={"files": file_infos},
     )
+    try:
+        upload_list = [(remote_path, local_path.read_bytes()) for local_path, remote_path in files]
+        results = sandbox.upload_files(upload_list)
+        errors = [r for r in results if r.error]
+        if errors:
+            raise RuntimeError(f"Upload failed for: {[r.path for r in errors]}")
+        span.update(
+            output={"uploaded": [r.path for r in results]},
+            metadata={"elapsed_seconds": round(time.monotonic() - t0, 3)},
+        )
+    except Exception as exc:
+        span.update(level="ERROR", status_message=str(exc))
+        raise
+    finally:
+        span.end()
 
 
-def _stop_sandbox(client: Any, session_id: str) -> None:
-    """Terminate the AgentCore sandbox session."""
-    client.stop_code_interpreter_session(
-        codeInterpreterIdentifier=_CODE_INTERPRETER_ID,
-        sessionId=session_id,
+def _verify_pydantic(interpreter: CodeInterpreter, parent: Any) -> str:
+    """
+    Return the pydantic version string available in the sandbox.
+
+    Creates a Langfuse span under *parent* recording the version check output.
+    """
+    t0 = time.monotonic()
+    span = parent.start_observation(
+        name="agentcore.verify_pydantic",
+        as_type="span",
+        input={"session_id": interpreter.session_id},
     )
+    try:
+        result = _run_python(
+            interpreter,
+            "import pydantic; print(f'pydantic {pydantic.__version__} OK')",
+        )
+        span.update(
+            output={"stdout": result.strip()},
+            metadata={"elapsed_seconds": round(time.monotonic() - t0, 3)},
+        )
+        return result
+    except Exception as exc:
+        span.update(level="ERROR", status_message=str(exc))
+        raise
+    finally:
+        span.end()
+
+
+def _stop_sandbox(interpreter: CodeInterpreter, parent: Any) -> None:
+    """
+    Terminate the AgentCore sandbox session.
+
+    Creates a Langfuse span under *parent* capturing termination timing.
+    """
+    t0 = time.monotonic()
+    span = parent.start_observation(
+        name="agentcore.stop_session",
+        as_type="span",
+        input={"session_id": interpreter.session_id},
+    )
+    try:
+        interpreter.stop()
+        span.update(
+            output={"status": "terminated"},
+            metadata={"elapsed_seconds": round(time.monotonic() - t0, 3)},
+        )
+    except Exception as exc:
+        span.update(level="ERROR", status_message=str(exc))
+        raise
+    finally:
+        span.end()
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +254,19 @@ def _stop_sandbox(client: Any, session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_agentcore_tool(client: Any, session_id: str):  # noqa: ANN201
+def _make_agentcore_tool(interpreter: CodeInterpreter, trace: Any):  # noqa: ANN201
     """
-    Return a plain Python callable that the DeepAgent can invoke as a tool.
+    Return a plain Python callable that the DeepAgent can invoke as a tool,
+    plus a one-element list used as a mutable reference to the active agent
+    step span so that each code execution is nested under its parent step.
 
     The callable accepts a ``code`` keyword argument and returns the sandbox
-    stdout as a string.
+    stdout as a string.  Every invocation is recorded as a Langfuse *tool*
+    span with the submitted code, stdout, and wall-clock timing.
     """
+    # Mutable slot updated by _run_agent_with_limits before/after each step
+    # so that execute_code spans are nested under the correct step span.
+    _step_span: list[Any] = [None]
 
     def execute_code(code: str) -> str:
         """
@@ -214,9 +278,33 @@ def _make_agentcore_tool(client: Any, session_id: str):  # noqa: ANN201
         Returns:
             The standard output produced by the code execution.
         """
-        return _run_code(client, session_id, code)
+        parent = _step_span[0] if _step_span[0] is not None else trace
+        t0 = time.monotonic()
+        span = parent.start_observation(
+            name="agentcore.execute_code",
+            as_type="tool",
+            input={"code": code, "code_length": len(code)},
+            metadata={"session_id": interpreter.session_id},
+        )
+        try:
+            stdout = _run_python(interpreter, code)
+            span.update(
+                output={"stdout": stdout, "output_length": len(stdout)},
+                metadata={
+                    "session_id": interpreter.session_id,
+                    "elapsed_seconds": round(time.monotonic() - t0, 3),
+                    "code_length": len(code),
+                    "output_length": len(stdout),
+                },
+            )
+            return stdout
+        except Exception as exc:
+            span.update(level="ERROR", status_message=str(exc))
+            raise
+        finally:
+            span.end()
 
-    return execute_code
+    return execute_code, _step_span
 
 
 # ---------------------------------------------------------------------------
@@ -224,17 +312,28 @@ def _make_agentcore_tool(client: Any, session_id: str):  # noqa: ANN201
 # ---------------------------------------------------------------------------
 
 
-def _build_agent(agentcore_tool):  # noqa: ANN001, ANN201
+_BEDROCK_MODEL_ID = "amazon.nova-lite-v1:0"
+
+
+def _build_agent(agentcore_tool, sandbox: AgentCoreSandbox):  # noqa: ANN001, ANN201
     """
     Build and return a DeepAgent bound to the AgentCore code interpreter.
 
-    Uses Claude 3.5 Sonnet as the underlying LLM.
+    Uses Amazon Nova Lite via AWS Bedrock as the underlying LLM.
+
+    Args:
+        agentcore_tool: The ``execute_code`` callable returned by
+            ``_make_agentcore_tool``.
+        sandbox:        The AgentCoreSandbox instance wrapping the active session,
     """
     from deepagents import create_deep_agent  # type: ignore[import]
+    from langchain_aws import ChatBedrock
 
+    llm = ChatBedrock(model=_BEDROCK_MODEL_ID, region=AWS_REGION)
     agent = create_deep_agent(
-        model="claude-3-5-sonnet-20241022",
+        model=llm,
         tools=[agentcore_tool],
+        backend=sandbox,
         system_prompt=(
             "You are a bioinformatics assistant specialising in VCF file processing. "
             "You have access to a remote Python sandbox via the `execute_code` tool. "
@@ -245,8 +344,11 @@ def _build_agent(agentcore_tool):  # noqa: ANN001, ANN201
 
 
 _EXTRACTION_PROMPT = (
-    "Extract variant data from /mnt/data/variants.vcf using the Pydantic model "
-    "defined in /mnt/data/schema.py. "
+    "Extract variant data using the `execute_code` tool. "
+    "The files you need to process are located in the remote sandbox: /opt/amazon/genesis1p-tools/pme/variants.vcf "
+    "with the target Pydantic schema located in /opt/amazon/genesis1p-tools/pme/schema.py. "
+    "If you have trouble locating the file directly, use execute_code to list the directory contents and find the correct path. "
+    "Try at least three different ways to locate the files if you do not find them on the first attempt. "
     "Validate all fields, correct formatting errors where possible (for example, "
     "coerce strings to floats for allele frequency), and return a JSON array of "
     "validated records under the key 'records', plus a 'total' count and a "
@@ -254,19 +356,76 @@ _EXTRACTION_PROMPT = (
 )
 
 
+def _extract_tool_calls(result: Any) -> list[dict[str, Any]]:
+    """Extract any LLM tool-call records from a deepagents / LangGraph result."""
+    calls: list[dict[str, Any]] = []
+    if not isinstance(result, dict):
+        return calls
+    for msg in result.get("messages", []):
+        raw_calls = getattr(msg, "tool_calls", None)
+        if not raw_calls:
+            continue
+        for tc in raw_calls:
+            if isinstance(tc, dict):
+                calls.append({"name": tc.get("name"), "args": tc.get("args")})
+            else:
+                calls.append({"name": getattr(tc, "name", str(tc))})
+    return calls
+
+
+def _extract_usage(result: Any) -> dict[str, int]:
+    """
+    Sum token counts across all AI messages in a deepagents / LangGraph result.
+
+    Tries the LangChain-standard ``usage_metadata`` field first
+    (``input_tokens`` / ``output_tokens``), then falls back to the
+    Bedrock-specific ``response_metadata['usage']`` (``inputTokens`` /
+    ``outputTokens``) for older langchain-aws versions.
+
+    Returns a dict with ``"input"``, ``"output"``, and ``"total"`` keys
+    suitable for passing directly to a Langfuse ``usage_details`` parameter,
+    or an empty dict if no usage data was found.
+    """
+    input_tokens = output_tokens = 0
+    if not isinstance(result, dict):
+        return {}
+    for msg in result.get("messages", []):
+        # LangChain standard (langchain_core >= 0.2, langchain-aws >= 0.2)
+        usage = getattr(msg, "usage_metadata", None)
+        if isinstance(usage, dict):
+            input_tokens += usage.get("input_tokens", 0)
+            output_tokens += usage.get("output_tokens", 0)
+            continue
+        # Bedrock-specific fallback via response_metadata
+        resp_meta = getattr(msg, "response_metadata", {})
+        bedrock = resp_meta.get("usage", {}) if isinstance(resp_meta, dict) else {}
+        input_tokens += bedrock.get("inputTokens", 0)
+        output_tokens += bedrock.get("outputTokens", 0)
+    if input_tokens == 0 and output_tokens == 0:
+        return {}
+    return {"input": input_tokens, "output": output_tokens, "total": input_tokens + output_tokens}
+
+
 def _run_agent_with_limits(
     agent,  # noqa: ANN001
     langfuse_trace,  # noqa: ANN001
+    step_span_holder: list[Any],
 ) -> str:
     """
     Run *agent* with wall-clock timeout and step-count limits.
 
-    Each agent step is sent to Langfuse as a child span so that the full
-    reasoning chain is captured in real-time.
+    Each agent step is recorded in Langfuse as a child span of
+    *langfuse_trace*, capturing the full conversation input, any tool calls
+    the LLM emitted, and the assistant reply.  The *step_span_holder* slot is
+    set to the active step span before the agent is invoked so that every
+    ``execute_code`` tool call is nested under the correct step.
 
     Args:
-        agent:          The DeepAgent instance.
-        langfuse_trace: An active Langfuse trace object.
+        agent:            The DeepAgent instance.
+        langfuse_trace:   An active Langfuse trace / span object.
+        step_span_holder: Single-element list shared with the
+            ``execute_code`` tool closure; updated to the current step span
+            before each agent invocation so tool spans are correctly nested.
 
     Returns:
         The agent's final text output.
@@ -312,28 +471,55 @@ def _run_agent_with_limits(
                 )
 
             step_count += 1
-            span = langfuse_trace.span(
+            step_span = langfuse_trace.start_observation(
                 name=f"agent_step_{step_count}",
-                input={"messages": messages},
-                metadata={"step": step_count, "elapsed_seconds": elapsed},
+                as_type="generation",
+                model=_BEDROCK_MODEL_ID,
+                input={
+                    "messages": messages,
+                    "message_count": len(messages),
+                },
+                metadata={"step": step_count, "elapsed_seconds": round(elapsed, 3)},
             )
+            # Share with execute_code so its spans nest under this step.
+            step_span_holder[0] = step_span
 
             # --- Execute one step ---
             # deepagents exposes .step() for single-turn execution;
             # fall back to .invoke() for libraries that only expose invoke.
-            if hasattr(agent, "step"):
-                result = agent.step({"messages": messages})
-            else:
-                result = agent.invoke({"messages": messages})
+            try:
+                if hasattr(agent, "step"):
+                    result = agent.step({"messages": messages})
+                else:
+                    result = agent.invoke({"messages": messages})
+            except Exception as exc:
+                step_span.update(level="ERROR", status_message=str(exc))
+                step_span.end()
+                step_span_holder[0] = None
+                raise
 
-            # Extract the assistant reply
+            step_span_holder[0] = None
+
+            # Extract the assistant reply, tool calls, and token usage.
             assistant_msg = _extract_assistant_message(result)
+            tool_calls = _extract_tool_calls(result)
+            usage = _extract_usage(result)
             last_output = assistant_msg
 
-            span.end(
-                output={"assistant": assistant_msg},
-                metadata={"step": step_count, "elapsed_seconds": time.monotonic() - start_time},
+            step_span.update(
+                output={
+                    "assistant": assistant_msg,
+                    "tool_calls": tool_calls,
+                    "is_terminal": _is_done(result),
+                },
+                usage_details=usage or None,
+                metadata={
+                    "step": step_count,
+                    "elapsed_seconds": round(time.monotonic() - start_time, 3),
+                    "tool_call_count": len(tool_calls),
+                },
             )
+            step_span.end()
 
             # Append the assistant reply to the message history
             messages.append({"role": "assistant", "content": assistant_msg})
@@ -459,8 +645,9 @@ def main() -> None:
     # --- Step 1: Initialise Langfuse ---
     print("Initialising Langfuse...")
     lf = _init_langfuse()
-    trace = lf.trace(
+    trace = lf.start_observation(
         name="vcf-extraction-pipeline",
+        as_type="span",
         metadata={
             "timeout_seconds": AGENT_TIMEOUT_SECONDS,
             "max_iterations": AGENT_MAX_ITERATIONS,
@@ -468,44 +655,51 @@ def main() -> None:
         },
     )
 
-    agentcore_client = None
-    session_id: str | None = None
+    interpreter: CodeInterpreter | None = None
+    sandbox: AgentCoreSandbox | None = None
     success = False
     final_output: dict[str, Any] = {}
 
     try:
         # --- Step 2: Provision sandbox ---
         print("Starting AgentCore code-interpreter session...")
-        agentcore_client = _create_agentcore_client()
-        session_id = _start_sandbox(agentcore_client)
-        print(f"Sandbox session started: {session_id}")
-        trace.event(name="sandbox_started", metadata={"session_id": session_id})
+        interpreter = CodeInterpreter(region=AWS_REGION)
+        sandbox = AgentCoreSandbox(interpreter=interpreter)
+        _start_sandbox(interpreter, trace)
+        print(f"Sandbox session started: {interpreter.session_id}")
+        trace.create_event(name="sandbox_started", metadata={"session_id": interpreter.session_id})
 
         # --- Step 3: Seed sandbox ---
         print("Uploading schema.py and variants.vcf to sandbox...")
-        _upload_file(agentcore_client, session_id, _SCHEMA_PATH, f"{_SANDBOX_DATA_DIR}/schema.py")
-        _upload_file(agentcore_client, session_id, _VCF_PATH, f"{_SANDBOX_DATA_DIR}/variants.vcf")
-        trace.event(name="files_uploaded", metadata={"files": ["schema.py", "variants.vcf"]})
+        _upload_files(
+            sandbox,
+            [
+                (_SCHEMA_PATH, f"{_SANDBOX_DATA_DIR}/schema.py"),
+                (_VCF_PATH, f"{_SANDBOX_DATA_DIR}/variants.vcf"),
+            ],
+            trace,
+        )
+        trace.create_event(name="files_uploaded", metadata={"files": ["schema.py", "variants.vcf"]})
 
         # --- Step 4: Verify pydantic ---
-        pydantic_check = _verify_pydantic(agentcore_client, session_id)
+        pydantic_check = _verify_pydantic(interpreter, trace)
         print(f"Pydantic check: {pydantic_check.strip()}")
-        trace.event(name="pydantic_verified", metadata={"output": pydantic_check})
+        trace.create_event(name="pydantic_verified", metadata={"output": pydantic_check})
 
         # --- Step 5: Build agent ---
         print("Building DeepAgent with AgentCore code interpreter...")
-        execute_code_tool = _make_agentcore_tool(agentcore_client, session_id)
-        agent = _build_agent(execute_code_tool)
-        trace.event(name="agent_built", metadata={"model": "claude-3-5-sonnet-20241022"})
+        execute_code_tool, step_span_holder = _make_agentcore_tool(interpreter, trace)
+        agent = _build_agent(execute_code_tool, sandbox)
+        trace.create_event(name="agent_built", metadata={"model": _BEDROCK_MODEL_ID})
 
         # --- Step 6: Run agent ---
         print(
             f"Running agent (timeout={AGENT_TIMEOUT_SECONDS}s, "
             f"max_iterations={AGENT_MAX_ITERATIONS})..."
         )
-        raw_output = _run_agent_with_limits(agent, trace)
+        raw_output = _run_agent_with_limits(agent, trace, step_span_holder)
         print("Agent run complete.")
-        trace.event(name="agent_complete", metadata={"output_preview": raw_output[:500]})
+        trace.create_event(name="agent_complete", metadata={"output_preview": raw_output[:500]})
 
         # --- Step 7: Parse and validate output ---
         print("Parsing and validating agent output...")
@@ -518,7 +712,7 @@ def main() -> None:
         final_output = _validate_results_locally(raw_data)
         record_count = len(final_output.get("records", []))
         print(f"Extracted and validated {record_count} variant record(s).")
-        trace.event(
+        trace.create_event(
             name="validation_complete",
             metadata={
                 "record_count": record_count,
@@ -531,17 +725,17 @@ def main() -> None:
     except TimeoutError as exc:
         msg = str(exc)
         print(f"ERROR (timeout): {msg}", file=sys.stderr)
-        trace.event(name="timeout_error", metadata={"error": msg})
+        trace.create_event(name="timeout_error", metadata={"error": msg})
 
     except RuntimeError as exc:
         msg = str(exc)
         print(f"ERROR (iteration limit): {msg}", file=sys.stderr)
-        trace.event(name="iteration_limit_error", metadata={"error": msg})
+        trace.create_event(name="iteration_limit_error", metadata={"error": msg})
 
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         print(f"ERROR: {msg}", file=sys.stderr)
-        trace.event(name="pipeline_error", metadata={"error": msg})
+        trace.create_event(name="pipeline_error", metadata={"error": msg})
 
     finally:
         # --- Step 8: Persist results ---
@@ -551,15 +745,17 @@ def main() -> None:
                 encoding="utf-8",
             )
             print(f"Results saved to {OUTPUT_JSON_PATH}")
-            trace.event(name="results_saved", metadata={"path": str(OUTPUT_JSON_PATH)})
+            trace.create_event(name="results_saved", metadata={"path": str(OUTPUT_JSON_PATH)})
 
         # --- Step 9: Terminate sandbox ---
-        if agentcore_client is not None and session_id is not None:
+        if interpreter is not None and interpreter.session_id is not None:
             print("Terminating sandbox session...")
             try:
-                _stop_sandbox(agentcore_client, session_id)
+                _stop_sandbox(interpreter, trace)
                 print("Sandbox session terminated.")
-                trace.event(name="sandbox_stopped", metadata={"session_id": session_id})
+                trace.create_event(
+                    name="sandbox_stopped", metadata={"session_id": interpreter.session_id}
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"WARNING: Failed to stop sandbox session: {exc}", file=sys.stderr)
 

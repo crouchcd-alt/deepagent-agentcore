@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.42.37",
+    "langchain-agentcore-codeinterpreter>=0.0.1",
+    "botocore[crt]>=1.42.76",
     "deepagents>=0.1.0",
+    "langchain-aws>=1.4.1",
     "langfuse>=2.0.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
