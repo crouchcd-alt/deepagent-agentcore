@@ -102,4 +102,7 @@ evaluation_results/
 
 # Ruff cache
 .ruff_cache/
+
 vcf-extraction/vcf_extraction_results.json
+
+vcf-extraction/variants.vcf*
