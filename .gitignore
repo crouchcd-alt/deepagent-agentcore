@@ -99,3 +99,10 @@ evaluation_results/
 .bedrock_agentcore.yaml
 
 .claude/
+
+# Ruff cache
+.ruff_cache/
+
+vcf-extraction/vcf_extraction_results.json
+
+vcf-extraction/variants.vcf*
