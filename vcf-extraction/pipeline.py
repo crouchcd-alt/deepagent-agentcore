@@ -58,9 +58,9 @@ load_dotenv(dotenv_path=_ENV_FILE, override=True)
 
 LANGFUSE_PUBLIC_KEY: str = os.environ["LANGFUSE_PUBLIC_KEY"]
 LANGFUSE_SECRET_KEY: str = os.environ["LANGFUSE_SECRET_KEY"]
-# Accept either LANGFUSE_BASE_URL (preferred) or the legacy LANGFUSE_BASE_URL name.
-LANGFUSE_BASE_URL: str = os.getenv("LANGFUSE_BASE_URL") or os.getenv(
-    "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
+# Accept either LANGFUSE_HOST (preferred) or the legacy LANGFUSE_HOST name.
+LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST") or os.getenv(
+    "LANGFUSE_HOST", "https://cloud.langfuse.com"
 )
 
 AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
@@ -87,10 +87,10 @@ def _init_langfuse() -> Langfuse:
     client = Langfuse(
         public_key=LANGFUSE_PUBLIC_KEY,
         secret_key=LANGFUSE_SECRET_KEY,
-        host=LANGFUSE_BASE_URL,
+        host=LANGFUSE_HOST,
     )
     if not client.auth_check():
-        raise RuntimeError(f"Langfuse auth failed – check keys and host ({LANGFUSE_BASE_URL})")
+        raise RuntimeError(f"Langfuse auth failed – check keys and host ({LANGFUSE_HOST})")
     return client
 
 
