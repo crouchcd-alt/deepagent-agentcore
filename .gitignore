@@ -108,5 +108,4 @@ vcf-extraction/vcf_extraction_results.json
 vcf-extraction/variants.vcf*
 
 clinical-extraction/.langgraph_api/
-data/variants.vcf
-data/variants_large.vcf
+data/

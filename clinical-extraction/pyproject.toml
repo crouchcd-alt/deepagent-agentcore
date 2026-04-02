@@ -27,6 +27,7 @@ dependencies = [
     "botocore[crt]>=1.42.76",
     "python-dotenv>=1.0.0",
     "loguru>=0.7.3",
+    "pymupdf>=1.27.2.2",
 ]
 
 [tool.ruff]

@@ -51,7 +51,7 @@ class EmptyMessage(BaseMessage):
 
 # logger.remove(0)
 logger.add(
-    "logs/deepagent.log",
+    "logs/deepagent_pathology.log",
     rotation="10 MB",
     retention=5,
     format="{time} {level} {message}",
@@ -98,8 +98,8 @@ agent_loggers = [
     _log_model_call,
 ]
 
-VCF_PATH = Path("../data/variants_large.vcf").resolve()
-SCHEMA_PATH = Path("./src/schemas/vcf.py").resolve()
+REPORT_PATH = Path("../data/synthetic_pathology_report_AML.pdf").resolve()
+SCHEMA_PATH = Path("./src/schemas/pathology.py").resolve()
 
 
 def start_sandbox():
@@ -132,30 +132,30 @@ def sandbox_info(sandbox):
 
 
 def upload_files(sandbox, cwd: str) -> tuple[str, str]:
-    with open(VCF_PATH, "rb") as f:
-        sandbox.upload_files([("variants.vcf", f.read())])
+    with open(REPORT_PATH, "rb") as f:
+        sandbox.upload_files([("pathology_report.pdf", f.read())])
     with open(SCHEMA_PATH, "rb") as f:
         sandbox.upload_files([("schema.py", f.read())])
 
-    vcf_abs = f"{cwd}/variants.vcf"
+    report_abs = f"{cwd}/pathology_report.pdf"
     schema_abs = f"{cwd}/schema.py"
 
     # Verify both files are visible at the expected paths before handing them
     # to the agent — fail fast rather than letting the agent churn.
-    check = sandbox.execute(f"ls {vcf_abs} {schema_abs}")
+    check = sandbox.execute(f"ls {report_abs} {schema_abs}")
     if check.exit_code != 0:
         raise RuntimeError(
             f"Uploaded files not found at expected paths (cwd={cwd}): {check.output.strip()}"
         )
 
-    logger.info("Files confirmed in sandbox | vcf={} schema={}", vcf_abs, schema_abs)
-    return vcf_abs, schema_abs
+    logger.info("Files confirmed in sandbox | report={} schema={}", report_abs, schema_abs)
+    return report_abs, schema_abs
 
 
-OUTPUT_FILE = "vcf_results.json"
+OUTPUT_FILE = "pathology_results.json"
 
 PROMPT = """\
-Parse the VCF file at {vcf_path} (your current working directory is {cwd}).
+Parse the pathology report PDF at {report_path} (your current working directory is {cwd}).
 
 **guidelines:**
 - Use `read_file` with offsets + limits to prevent reading the entire file into context. Some files are large (~2MB) and 3000+ rows.
@@ -170,20 +170,23 @@ for package in sorted(installed_packages, key=lambda x: x.project_name.lower()):
 If there's a package you want to use that's not installed, you should end your turn with an explanation for why the package is needed
 so that the user can install it and re-run you.
 
-Your goal is to extract the variants from the VCF file and validate them against the Pydantic schema at {schema_path}.
+Your goal is to extract the following fields from the pathology report and validate them against the Pydantic schema at {schema_path}:
+- **age**: The patient's age (integer).
+- **primary_diagnosis**: The primary diagnosis from the report.
+- **performance_status**: The ECOG or similar performance status, if present.
 
-**VCF processing rules:**
-- Process ALL variant rows.
-- Filter out records where FILTER is "FAIL".
+**Citation rules — every extracted value MUST include a verifiable citation:**
+- Each field is a `CitedField` with a `value` and a `citation`.
+- A `citation` contains `page` (1-indexed page number) and `text` (the **exact** quote from the PDF that supports the value — copy it verbatim, do not paraphrase).
+- The `text` must be a substring that can be found on the cited page when the PDF is re-parsed, so it can be programmatically verified.
+- If a field is not present in the report, set it to `null` rather than fabricating a citation.
 
 **Output rules:**
-1. Write a Python script that parses the VCF, validates each record with the Pydantic schema,
-   and writes the full result to `{cwd}/{output_file}` using json.dump().
-2. The output file must contain: {{"records": [...], "total": <row_count>, "validation_errors": [...]}}
-   where each record is produced by the Pydantic model's `.model_dump()`.
-3. Do NOT print or return the full records in your messages — they are too large for context.
-4. Your final message should be ONLY a JSON status (no prose):
-   {{"total": <total_row_count>, "file": "{cwd}/{output_file}", "file_size_bytes": <size>}}
+1. Write a Python script that extracts text from the PDF, parses the required fields along with their citations,
+   validates each record with the Pydantic schema, and writes the result to `{cwd}/{output_file}` using json.dump().
+2. The output file must contain the results produced by the Pydantic model's `.model_dump()`.
+3. Your final message should be ONLY a JSON status (no prose):
+   {{"total_fields_extracted": <int>, "file": "{cwd}/{output_file}", "file_size_bytes": <size>}}
 """
 
 
@@ -197,11 +200,11 @@ def _read_result_file(sandbox, file_path: str) -> dict:
 
 
 def run(sandbox, sandbox_infos):
-    vcf_path, schema_path = upload_files(sandbox, sandbox_infos["cwd"])
+    report_path, schema_path = upload_files(sandbox, sandbox_infos["cwd"])
 
     agent = create_deep_agent(
         model=ChatBedrock(
-            model="us.anthropic.claude-sonnet-4-6",  # os.environ["BEDROCK_AGENT_MODEL_ID"],
+            model="us.anthropic.claude-sonnet-4-6",
             region=os.environ["AWS_REGION"],
             max_tokens=4096,
         ),
@@ -223,7 +226,7 @@ def run(sandbox, sandbox_infos):
                 {
                     "role": "user",
                     "content": PROMPT.format(
-                        vcf_path=vcf_path,
+                        report_path=report_path,
                         schema_path=schema_path,
                         output_file=OUTPUT_FILE,
                         **sandbox_infos,
