@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent"
+version = "0.1.0"
+description = "AgentCore Runtime Application using LangChain/LangGraph"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aws-opentelemetry-distro",
+    "langgraph>=1.0.2",
+    "mcp >= 1.19.0",
+    "langchain-mcp-adapters >= 0.1.11",
+    "langchain >= 1.0.3",
+    "bedrock-agentcore >= 1.0.3",
+    "botocore[crt] >= 1.35.0",
+    "langchain-aws >= 1.0.0",
+    "langgraph-checkpoint-aws>=1.0.6",
+    "ag-ui-protocol>=0.1.8",
+    "ag-ui-langgraph[fastapi]>=0.0.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]

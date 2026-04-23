@@ -1,0 +1,22 @@
+{
+  "targets": {
+    "default": {
+      "resources": {
+        "runtimes": {
+          "agent": {
+            "runtimeId": "myassistant_agent-0lUKDA5WeW",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:AWS_ACCOUNT_ID_PLACEHOLDER:runtime/myassistant_agent-0lUKDA5WeW",
+            "roleArn": "arn:aws:iam::AWS_ACCOUNT_ID_PLACEHOLDER:role/AgentCore-myassistant-def-ApplicationAgentAgentRunt-DrZYgNwcf2FP"
+          }
+        },
+        "memories": {
+          "ChatSession": {
+            "memoryId": "myassistant_ChatSession-832jzV8qgO",
+            "memoryArn": "arn:aws:bedrock-agentcore:us-east-1:AWS_ACCOUNT_ID_PLACEHOLDER:memory/myassistant_ChatSession-832jzV8qgO"
+          }
+        },
+        "stackName": "AgentCore-myassistant-default"
+      }
+    }
+  }
+}

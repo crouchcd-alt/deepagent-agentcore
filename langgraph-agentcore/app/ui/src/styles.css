@@ -1,0 +1,92 @@
+:root {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  color-scheme: light dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 0; background: #0f1115; color: #e5e7eb; }
+
+.app {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px 16px 96px;
+  min-height: 100vh;
+}
+
+h1 { font-size: 20px; margin: 0 0 16px; opacity: 0.85; font-weight: 600; }
+
+.status {
+  font-size: 12px;
+  opacity: 0.7;
+  margin-bottom: 12px;
+  font-family: ui-monospace, monospace;
+  min-height: 16px;
+}
+
+.msg {
+  padding: 10px 14px;
+  border-radius: 12px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+.msg.user { background: #1f2937; align-self: flex-end; }
+.msg.assistant { background: #111827; border: 1px solid #1f2937; }
+.msg .role {
+  font-size: 11px;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 4px;
+  letter-spacing: 0.05em;
+}
+
+.tool {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  background: #0b1220;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  color: #93c5fd;
+}
+.tool .args, .tool .result { color: #e5e7eb; opacity: 0.9; }
+.tool .result { color: #86efac; }
+
+.feed { display: flex; flex-direction: column; }
+
+form {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  background: rgba(15, 17, 21, 0.9);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid #1f2937;
+}
+form > div {
+  max-width: 760px;
+  margin: 0 auto;
+  width: 100%;
+  display: flex;
+  gap: 8px;
+}
+input[type="text"] {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #1f2937;
+  background: #0b1220;
+  color: inherit;
+  font: inherit;
+}
+button {
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid #1d4ed8;
+  background: #1d4ed8;
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }

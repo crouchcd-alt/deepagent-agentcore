@@ -109,3 +109,4 @@ vcf-extraction/variants.vcf*
 
 clinical-extraction/.langgraph_api/
 data/
+.env.masked

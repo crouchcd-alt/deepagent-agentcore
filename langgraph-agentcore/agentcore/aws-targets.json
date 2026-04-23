@@ -1,0 +1,8 @@
+[
+  {
+    "name": "default",
+    "description": "Default target (us-east-1)",
+    "account": "AWS_ACCOUNT_ID_PLACEHOLDER",
+    "region": "us-east-1"
+  }
+]
